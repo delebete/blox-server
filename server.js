@@ -10,10 +10,8 @@ console.log(`Blox Server started on port ${port}`);
 let players = {};
 let world = {}; // Stores blocks placed by users
 
-// Helper to generate short IDs
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
-// Broadcast to everyone (including sender if includeSelf is true)
 function broadcast(data, senderWs, includeSelf = false) {
     const msg = JSON.stringify(data);
     wss.clients.forEach(client => {
@@ -25,21 +23,36 @@ function broadcast(data, senderWs, includeSelf = false) {
     });
 }
 
+// --- HEARTBEAT SYSTEM (Fixes Stuck Players) ---
+// Checks every 30 seconds for dead connections
+const interval = setInterval(function ping() {
+    wss.clients.forEach(function each(ws) {
+        if (ws.isAlive === false) {
+            console.log(`Connection ${ws.connId} timed out.`);
+            return ws.terminate(); // Force close, triggering the 'close' event below
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 30000);
+
 wss.on('connection', (ws) => {
-    // Assign a temporary connection ID
     const connId = generateId();
     ws.connId = connId;
-    
+    ws.playerId = null; 
+    ws.isAlive = true; // Mark alive on connect
+
     console.log(`Client connected: ${connId}`);
 
-    // 1. Send WELCOME packet (Current State)
-    const playerList = Object.values(players);
-    const worldList = Object.values(world);
-    
+    ws.on('pong', () => {
+        ws.isAlive = true; // Client responded to ping
+    });
+
+    // Send WELCOME packet
     ws.send(JSON.stringify({
         type: 'WELCOME',
-        players: playerList,
-        world: worldList
+        players: Object.values(players),
+        world: Object.values(world)
     }));
 
     ws.on('message', (message) => {
@@ -48,28 +61,24 @@ wss.on('connection', (ws) => {
 
             switch (data.type) {
                 case 'PLAYER_UPDATE':
-                    // Update server state
+                    if (!ws.playerId) {
+                        ws.playerId = data.id;
+                        console.log(`Associated ${ws.connId} with Player ${data.id}`);
+                    }
                     players[data.id] = data;
-                    // Broadcast movement to EVERYONE ELSE
                     broadcast(data, ws, false);
                     break;
 
                 case 'REQ_WORLD_CREATE':
-                    // Server Authority: Create ID and save
                     const newId = generateId();
                     const newPart = { ...data.data, id: newId };
-                    
                     world[newId] = newPart;
-                    
-                    // Tell EVERYONE (including creator) to spawn it
                     broadcast({ type: 'WORLD_CREATE', data: newPart }, ws, true);
                     break;
 
                 case 'REQ_WORLD_UPDATE':
                     if (world[data.id]) {
-                        // Update local state
                         world[data.id] = { ...world[data.id], ...data.data };
-                        // Broadcast update
                         broadcast({ type: 'WORLD_UPDATE', id: data.id, data: data.data }, ws, true);
                     }
                     break;
@@ -87,18 +96,16 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
-        console.log(`Client disconnected: ${connId}`);
-        
-        // Find which player ID belonged to this connection
-        // (In a real app, we'd map connId to playerId better, 
-        // but here we rely on the client having sent their ID in PLAYER_UPDATE)
-        
-        // We can't easily know the player ID just from close unless we stored it,
-        // but for this simple example, we wait for the client logic or rely on timeouts.
-        // However, to be safe, let's look for the player in our list if we can.
-        
-        // Note: In this simple implementation, we don't strictly remove players 
-        // from the 'players' object on close to keep them persistent for a bit,
-        // but usually you would broadcast a PLAYER_LEAVE here.
+        console.log(`Client disconnected: ${ws.connId}`);
+        if (ws.playerId && players[ws.playerId]) {
+            console.log(`Removing player: ${ws.playerId}`);
+            delete players[ws.playerId];
+            // Broadcast to everyone else to remove this avatar
+            broadcast({ type: 'PLAYER_LEAVE', id: ws.playerId }, ws, false);
+        }
     });
+});
+
+wss.on('close', () => {
+    clearInterval(interval);
 });
